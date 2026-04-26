@@ -160,37 +160,51 @@ def _update_stats_and_elo(db: Session, debate: models.Debate, result: DebateResu
 async def _finalize_debate(debate_id, result: DebateResult, evaluation: dict = None, mutual: bool = False):
     """Apply ELO, save to DB, emit debate_ended to both players."""
     try:
+        payload = None
         with database.SessionLocal() as db:
             db_debate = db.query(models.Debate).filter(models.Debate.id == debate_id).first()
             if not db_debate or db_debate.status == DebateStatus.completed:
+                print(f"[_finalize_debate] skipping debate {debate_id} — already completed or not found")
                 return
 
             p1, p2, c1, c2 = _update_stats_and_elo(db, db_debate, result)
             if not p1 or not p2:
+                print(f"[_finalize_debate] could not find players for debate {debate_id}")
                 return
 
             if mutual:
                 badges_engine.award_badge(db, p1, "peacemaker")
                 badges_engine.award_badge(db, p2, "peacemaker")
 
+            # Build payload INSIDE session while objects are still attached
             payload = {
-                'debate_id': debate_id,
-                'result':    result.value,
-                'winner':    db_debate.winner,
+                'debate_id':     debate_id,
+                'result':        result.value,
+                'winner':        db_debate.winner,
+                'player1_score': evaluation.get('player1_score', 50) if evaluation else 50,
+                'player2_score': evaluation.get('player2_score', 50) if evaluation else 50,
                 'p1': {
-                    'id': p1.id, 'username': p1.username,
+                    'id':         p1.id,
+                    'username':   p1.username,
                     'elo_before': db_debate.p1_elo_before,
-                    'elo_after':  p1.elo, 'elo_change': c1,
+                    'elo_after':  p1.elo,
+                    'elo_change': c1,
                 },
                 'p2': {
-                    'id': p2.id, 'username': p2.username,
+                    'id':         p2.id,
+                    'username':   p2.username,
                     'elo_before': db_debate.p2_elo_before,
-                    'elo_after':  p2.elo, 'elo_change': c2,
+                    'elo_after':  p2.elo,
+                    'elo_change': c2,
                 },
                 'evaluation': evaluation,
             }
-            # Emit to the debate room — both players receive this
+            print(f"[_finalize_debate] payload built for debate {debate_id}, winner={db_debate.winner}, has_evaluation={evaluation is not None}")
+
+        # Emit OUTSIDE the session — session is closed, payload is a plain dict
+        if payload:
             await sio.emit('debate_ended', payload, room=str(debate_id))
+            print(f"[_finalize_debate] debate_ended emitted to room {debate_id}")
             debate_players.pop(str(debate_id), None)
 
     except Exception:
@@ -517,3 +531,17 @@ async def _handle_forfeit(debate_id_str: str, leaver_uid: str, reason: str = "fo
 
     except Exception:
         traceback.print_exc()
+
+
+@sio.event
+async def end_vote(sid, data):
+    """One player clicked End Debate — immediately trigger evaluation for both."""
+    debate_id = data.get('debateId') or data.get('debate_id')
+    voter_id  = str(data.get('voter_id', ''))
+    if not debate_id:
+        return
+    print(f"[end_vote] player {voter_id} ended debate {debate_id} — triggering evaluation")
+    # Broadcast to room so opponent UI shows "evaluating" state
+    await sio.emit('end_vote', {'voter_id': voter_id, 'debate_id': debate_id}, room=str(debate_id))
+    # Immediately finalize — one click is enough
+    await end_debate(sid, {'debate_id': debate_id, 'debateId': debate_id})
